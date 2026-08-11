@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conquest: Flag Clash</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:#0a1628;color:#dce8ff;overflow:hidden}
+#game{width:100%;height:100%;display:block;background:#0a1628}
+#hud{position:absolute;top:12px;left:50%;transform:translateX(-50%);display:flex;gap:12px;align-items:center;z-index:2;font-size:14px}
+#hud span{background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.25);padding:6px 10px;border-radius:6px}
+#hud button{background:#2a3855;color:#e6e9ef;border:1px solid #5a719e;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px}
+#hud button:disabled{opacity:.45;cursor:not-allowed}
+#panel{position:absolute;left:12px;bottom:12px;z-index:2;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.25);border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.6;max-width:280px}
+#panel b{color:#fff}
+#overlay{position:absolute;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:rgba(8,12,24,0.85)}
+#overlay .card{background:#14213d;border:1px solid #3a5073;border-radius:12px;padding:24px 28px;text-align:center;max-width:420px}
+#overlay button{margin-top:14px;background:#2a3855;color:#e6e9ef;border:1px solid #5a719e;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:15px}
+.flag2{display:inline-block;width:.9em;height:.7em;vertical-align:middle;border-radius:2px;overflow:hidden;margin-right:4px}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud">
+  <span id="status">Подготовка…</span>
+  <span id="scores"></span>
+  <button id="btn">Сдать ход</button>
+</div>
+<div id="panel"><b>Правила:</b> <br>1. Красные и синие по очереди выбирают 2 страны (базы).<br>2. На ход выбираете свой флаг — клик, затем клик по соседней стране.<br>3. Вражеский флаг берут, если рядом ещё ваш флаг (поддержка). Без поддержки ваш флаг погибает.<br>4. Захватите все флаги соперника или контролируйте ≥50% стран.</div>
+<div id="overlay">
+  <div class="card">
+    <h2 style="margin-bottom:4px;font-size:20px">Conquest: Flag Clash</h2>
+    <p style="font-size:14px">Две команды, мини‑флаги, захват территорий.</p>
+    <p style="font-size:13px;margin:8px 0 0">Нажмите, чтобы начать.</p>
+    <button id="startbtn">Начать игру</button>
+  </div>
+</div>
+<script src="conquest_poly.js"></script>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H, PW, PH, OX, OY, zoom = 1, panX = 0, panY = 0;
+
+const RED = 1, BLUE = 2, NEUTRAL = 0;
+const TC = {'#e74c3c': RED, '#3498db': BLUE};
+const TEAM_COLOR = {1: '#e74c3c', 2: '#3498db'};
+
+let owner = {}, flag = {}, turn = 0;       // owner[code]=team controlling, flag[code]=team with flag
+let phase = 'setup';                      // 'setup' | 'play' | 'over'
+let setupTeam = RED;
+let pickCount = {1:0, 2:0};
+let selFlag = null;                       // currently selected friendly flag code
+let moveCount = 0;
+
+const STATUS = document.getElementById('status');
+const SCORES = document.getElementById('scores');
+const BTN = document.getElementById('btn');
+const OV = document.getElementById('overlay');
+
+function resize(){
+  const r = canvas.getBoundingClientRect();
+  W = r.width; H = r.height;
+  PW = W * 0.9; PH = PW * 0.45; OX = W * 0.05; OY = H * 0.5 - PH * 0.45;
+  clampPan();
+  redraw();
+}
+function clampPan(){
+  const mw = PW * zoom, mh = PH * zoom;
+  if (mw >= W){ panX = Math.min(Math.max(panX, W - OX - mw), -OX); } else { panX = Math.min(Math.max(panX, -OX), W - mw - OX); }
+  if (mh >= H){ panY = Math.min(Math.max(panY, H - OY - mh), -OY); } else { panY = Math.min(Math.max(panY, -OY), H - mh - OY); }
+}
+function basept(lon, lat){ return [(lon/180+1)*0.5*PW + OX, (0.5 - lat/180)*PH + OY]; }
+function proj(lon, lat){
+  const b = basept(lon, lat);
+  return [(b[0]-OX)*zoom + OX + panX, (b[1]-OY)*zoom + OY + panY];
+}
+function unproj(sx, sy){
+  const bx = (sx - OX - panX)/zoom + OX;
+  const by = (sy - OY - panY)/zoom + OY;
+  const lon = ((bx - OX)/(0.5*PW) - 1)*180;
+  const lat = (0.5 - (by - OY)/PH)*180;
+  return [lon, lat];
+}
+
+// ---- geometry ----
+function ringArea(ring){ let a=0; for(let i=0;i<ring.length;i++){const p1=ring[i],p2=ring[(i+1)%ring.length]; a+=p1[0]*p2[1]-p2[0]*p1[1];} return Math.abs(a)/2; }
+function pointInRing(p, ring){
+  let inside=false;
+  for(let i=0,n=ring.length,j=n-1;i<n;j=i++){
+    const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1];
+    if(((yi>p[1])!==(yj>p[1])) && (p[0] < (xj-xi)*(p[1]-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+function pointInCountry(lon, lat, code){
+  const rings = C_WP[code];
+  if(!rings) return false;
+  for(const ring of rings){
+    if(!ring || ring.length<3) continue;
+    if(pointInRing([lon,lat], ring)) return true;
+    if(lon < 0){
+      const sh = ring.map(pp=>[pp[0]<0?pp[0]+360:pp[0], pp[1]]);
+      if(pointInRing([lon+360,lat], sh)) return true;
+    }
+  }
+  return false;
+}
+function findCountry(lon, lat){
+  let best=null; let bestA=1e18;
+  // quick bbox reject using centroid? just brute (275 rings)
+  for(const code in C_WP){
+    const rings=C_WP[code];
+    if(!rings) continue;
+    for(const ring of rings){
+      let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+      for(let i=0;i<ring.length;i++){const p=ring[i];if(p[0]<minX)minX=p[0];if(p[0]>maxX)maxX=p[0];if(p[1]<minY)minY=p[1];if(p[1]>maxY)maxY=p[1];}
+      if(lon<minX||lon>maxX||lat<minY||lat>maxY) continue;
+      if(pointInRing([lon,lat], ring)){ const a=ringArea(ring); if(a<bestA){bestA=a;best=code;} return best; }
+      if(lon<0){ const sh=ring.map(pp=>[pp[0]<0?pp[0]+360:pp[0],pp[1]]); if(pointInRing([lon+360,lat],sh)){ const a=ringArea(sh); if(a<bestA){bestA=a;best=code;} } }
+    }
+  }
+  return best;
+}
+
+function centroid(code){ const e = C_POOL.find(r=>r[0]===code); return e?[e[2],e[3]]:[0,0]; }
+
+// ---- render ----
+function fillColor(team){ return team===RED?'rgba(231,76,63,0.55)':team===BLUE?'rgba(52,152,219,0.55)':'rgba(42,49,60,0.55)'; }
+function strokeCol(team, strong){
+  if(team===RED) return strong?'#ff6b6b':'rgba(231,76,63,0.5)';
+  if(team===BLUE) return strong?'#60a6ff':'rgba(52,152,219,0.5)';
+  return strong?'#8a97ae':'rgba(42,49,60,0.7)';
+}
+function redraw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#081020'; ctx.fillRect(0,0,W,H);
+  // draw owned countries
+  for(const code in C_WP){
+    const rings=C_WP[code]; if(!rings||rings.length===0) continue;
+    drawPolygon(code, rings);
+  }
+  // move highlights
+  if(selFlag){
+    // draw legal targets
+    for(const nb of (C_NEIGH[selFlag]||[])){
+      const rings=C_WP[nb]; if(!rings){const [lx,ly]=proj(centroid(nb)[0],centroid(nb)[1]); drawFlag(lx,ly,owner[nb]===flagTeam(selFlag)?'gray':'yellow'); continue;}
+      let path=false;
+      ctx.beginPath();
+      for(const ring of rings){ if(!ring||ring.length<3)continue; const p0=proj(ring[0][0],ring[0][1]); ctx.moveTo(p0[0],p0[1]); for(let i=1;i<ring.length;i++){const p=proj(ring[i][0],ring[i][1]);ctx.lineTo(p[0],p[1]);} }
+      ctx.closePath(); path=true;
+      if(path){ ctx.fillStyle='rgba(255,244,120,0.35)'; ctx.fill('evenodd'); ctx.strokeStyle='#ffdd40'; ctx.lineWidth=2; ctx.stroke();}
+    }
+    // redraw flags on top
+    for(const code in flag){ if(flag[code]) drawFlagAt(code); }
+    drawFlagAt(selFlag);
+  } else {
+    for(const code in flag){ if(flag[code]) drawFlagAt(code); }
+  }
+  // labels for countries with flags
+  ctx.font='10px "Segoe UI",sans-serif'; ctx.fillStyle='#dce8ff'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(const code in flag){ if(flag[code]) { const c=centroid(code); const p=proj(c[0],c[1]); ctx.fillText(code,p[0],p[1]-9);} }
+  drawHUD();
+}
+function flagTeam(code){ return flag[code]||0; }
+function drawFlagAt(code){
+  const c=centroid(code); const p=proj(c[0],c[1]); drawFlag(p[0],p[1], TEAM_COLOR[flag[code]]);
+}
+function drawFlag(x,y,col){
+  // pennant
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle=col; ctx.strokeStyle='#fff'; ctx.lineWidth=0.6;
+  ctx.beginPath(); ctx.rect(-9,-6,5,7); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-4,-6); ctx.lineTo(6,-6); ctx.lineTo(2,0); ctx.lineTo(-4,0); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(1,-3,1.6,0,Math.PI*2); ctx.fillStyle='#fff'; ctx.fill();
+  ctx.restore();
+}
+function drawPolygon(code, rings){
+  const t = owner[code]||NEUTRAL;
+  const fillC = fillColor(t), strC = strokeCol(t,true);
+  ctx.beginPath();
+  for(const ring of rings){
+    if(!ring||ring.length<3) continue;
+    const p0=proj(ring[0][0],ring[0][1]);
+    ctx.moveTo(p0[0],p0[1]);
+    for(let i=1;i<ring.length;i++){const p=proj(ring[i][0],ring[i][1]);ctx.lineTo(p[0],p[1]);}
+  }
+  ctx.closePath();
+  ctx.fillStyle=fillC; ctx.fill('evenodd');
+  ctx.strokeStyle=strC; ctx.lineWidth=(t===NEUTRAL?0.6:1.1); ctx.stroke();
+}
+
+function drawHUD(){
+  if(phase==='over') return;
+  STATUS.textContent = hudStatus();
+  SCORES.textContent = '🔴 '+countTeam(RED)+'  флагов | 🔵 '+countTeam(BLUE)+'  флагов';
+  BTN.textContent = btnText();
+}
+function hudStatus(){
+  if(phase==='setup'){
+    const t=setupTeam;
+    return (t===RED?'🔴 Красные':'🔵 Синие')+' выбирают страну ('+pickCount[t]+'/2)';
+  }
+  return (turn===RED?'🔴 Ход Красных':'🔵 Ход Синих')+'  ·  ходов: '+(moveCount);
+}
+function btnText(){ if(phase==='setup') return 'Пропустить'; return 'Сдать ход'; }
+function countTeam(t){ let c=0; for(const k in flag){ if(flag[k]===t) c++; } return c; }
+
+// ---- input ----
+let drag=false, dragStart=[0,0], origin=[0,0];
+canvas.addEventListener('mousedown', e=>{
+  if(phase==='over') return;
+  if(e.button!==0) return;
+  drag=true; dragStart=[e.offsetX,e.offsetY]; origin=[panX,panY];
+});
+canvas.addEventListener('mousemove', e=>{ if(drag){ panX=origin[0]+e.offsetX-dragStart[0]; panY=origin[1]+e.offsetY-dragStart[1]; clampPan(); redraw(); } });
+window.addEventListener('mouseup', e=>{ if(e.button!==0) return; drag=false; });
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const f = Math.pow(1.0013, -e.deltaY);
+  const zx = e.offsetX, zy = e.offsetY;
+  const lonlat = unproj(zx, zy);
+  const b = basept(lonlat[0], lonlat[1]);
+  zoom = Math.min(Math.max(zoom*f, 1), 20);
+  clampPan();
+  // keep lonlat fixed under cursor
+  panX = zx - (b[0] - OX) * zoom - OX;
+  panY = zy - (b[1] - OY) * zoom - OY;
+  clampPan();
+  redraw();
+});
+
+let clickStart=null;
+canvas.addEventListener('mousedown', e=>{ if(e.button===0){ clickStart=[e.offsetX,e.offsetY]; } });
+canvas.addEventListener('click', onClickMap);
+
+function onClickMap(e){
+  if(drag && (Math.abs(e.offsetX-clickStart[0]) + Math.abs(e.offsetY-clickStart[1]) > 3)) { drag=false; clickStart=null; return; }
+  drag=false; clickStart=null;
+  if(phase==='over'){ resetGame(); return; }
+  const r = canvas.getBoundingClientRect();
+  const x=e.clientX-r.left, y=e.clientY-r.top;
+  const lonlat=unproj(x,y);
+  const code=findCountry(lonlat[0],lonlat[1]);
+  if(!code){ if(phase==='play' && selFlag){ selFlag=null; redraw(); } return; }
+  if(phase==='setup'){
+    if(owner[code]!==NEUTRAL) return;
+    if(pickCount[setupTeam]>=2) return;
+    flag[code]=setupTeam; owner[code]=setupTeam; pickCount[setupTeam]++;
+    if(pickCount[1]>=2 && pickCount[2]>=2){ phase='play'; turn=RED; moveCount=0; drawHUD(); redraw(); }
+    else { setupTeam = setupTeam===RED?BLUE:RED; drawHUD(); }
+    redraw();
+    return;
+  }
+  if(phase==='play'){
+    const t=turn;
+    if(selFlag){
+      if(C_NEIGH[selFlag] && C_NEIGH[selFlag].indexOf(code)>=0){ resolveMove(selFlag,code); }
+      else if(code===selFlag){ selFlag=null; redraw(); }
+      else { if(flag[code]===t){ selFlag=code; redraw(); } }
+      return;
+    } else {
+      if(flag[code]===t){ selFlag=code; redraw(); }
+    }
+  }
+}
+
+function resolveMove(from, to){
+  const team=flag[from];
+  if(!team || !C_NEIGH[from] || C_NEIGH[from].indexOf(to)<0) return;
+  const isEnemy = flag[to] && flag[to]!==team;
+  if(!isEnemy){
+    flag[from]=0; owner[from]=NEUTRAL;
+    flag[to]=team; owner[to]=team;
+  } else {
+    let support=0;
+    for(const nb of (C_NEIGH[to]||[])){ if(flag[nb]===team) support++; }
+    if(support>=2){
+      flag[to]=team; owner[to]=team;
+      flag[from]=0; owner[from]=NEUTRAL;
+    } else {
+      flag[from]=0; owner[from]=NEUTRAL;
+    }
+  }
+  selFlag=null;
+  moveCount++;
+  turn = turn===RED?BLUE:RED;
+  checkWin();
+  redraw();
+}
+
+function btnAction(){
+  if(phase==='setup'){
+    if(pickCount[setupTeam]<2){
+      let chosen=null;
+      for(const r of C_POOL){ const c=r[0]; if(!owner[c]){ chosen=c; break; } }
+      if(chosen){ flag[chosen]=setupTeam; owner[chosen]=setupTeam; pickCount[setupTeam]++; }
+      if(pickCount[1]>=2 && pickCount[2]>=2){ phase='play'; turn=RED; moveCount=0; drawHUD(); redraw(); }
+      else { setupTeam=setupTeam===RED?BLUE:RED; drawHUD(); }
+    } else { setupTeam=setupTeam===RED?BLUE:RED; drawHUD(); }
+  } else if(phase==='play'){
+    selFlag=null; turn=turn===RED?BLUE:RED; redraw();
+  }
+}
+BTN.addEventListener('click', btnAction);
+
+function resetGame(){
+  owner={}; flag={}; turn=0; phase='setup'; setupTeam=RED; pickCount={1:0,2:0}; selFlag=null; moveCount=0;
+  BTN.style.display='';
+  OV.style.display='flex'; redraw();
+}
+document.getElementById('startbtn').addEventListener('click', ()=>{ OV.style.display='none'; resetGame(); resize(); });
+
+function checkWin(){
+  const nPool=C_POOL.length;
+  const half=Math.ceil(nPool*0.5);
+  let redC=0, blueC=0;
+  for(const k in owner){ if(owner[k]===RED)redC++; else if(owner[k]===BLUE)blueC++; }
+  if(countTeam(BLUE)===0){ endGame(RED); return; }
+  if(countTeam(RED)===0){ endGame(BLUE); return; }
+  if(redC>=half){ endGame(RED); return; }
+  if(blueC>=half){ endGame(BLUE); return; }
+}
+function endGame(winner){
+  phase='over';
+  STATUS.textContent='🏆 '+ (winner===RED?'🔴 Красные':'🔵 Синие')+' победили! (ходов: '+moveCount+')';
+  BTN.style.display='none';
+  redraw();
+}
+
+// pan/zoom
+window.addEventListener('resize', resize);
+resetGame();
+resize();
+</script>
+</body>
+</html>
